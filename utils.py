@@ -1,11 +1,18 @@
-"""Shared helpers: device selection, the MCMC sampler, and the Bitmoji data pipeline."""
+"""Shared helpers: the Langevin sampler, the EBM loss, the replay buffer, toy data and the
+Bitmoji image pipeline.
+
+Notation follows the lecture (https://parag1604.github.io/notes/Machine-Learning/Energy-Based-Models):
+the networks output an energy E_theta(x) (low = likely), p_theta(x) = exp(-E_theta(x)) / Z_theta.
+"""
 
 import os
+import math
 import argparse
+from multiprocessing import Pool
 
+import numpy as np
 import torch
-from torch.utils.data import Dataset
-from torchvision import transforms, datasets
+import torch.nn.functional as F
 
 
 def get_device():
@@ -17,111 +24,171 @@ def get_device():
 
 
 # ---------------------------------------------------------------------------
-# Sampling from an EBM
+# Sampling: Langevin dynamics
 # ---------------------------------------------------------------------------
-def sample(model, x_init, steps=25, step_size=10, noise_std=0.01,
-           grad_clamp=(-0.03, 0.03), x_clamp=(-3, 3)):
-    """Short-run, Langevin-style MCMC on the energy E(x) = -model(x).
+def langevin(energy_fn, x_init, steps, step_size, noise_std, grad_clip=None, x_range=None):
+    """Short-run Langevin dynamics on the energy  E(x) = energy_fn(x)  (one value per sample).
 
-    Each step moves x downhill on the energy and adds a little Gaussian noise:
-        x <- x - step_size * clamp(dE/dx) + noise_std * eps,   eps ~ N(0, I).
-    (Exact Langevin dynamics would use noise_std = sqrt(2 * step_size); like most
-    practical EBM code, we use much less noise and clip the gradient so that a few
-    steps make steady progress without blowing up.)
+        x_{k+1} = x_k - step_size * grad_x E(x_k) + noise_std * eps_k,   eps_k ~ N(0, I).
 
-    The parameters of the model are frozen while sampling: we only want gradients
-    with respect to the input x.
+    With step_size = eta / 2 and noise_std = sqrt(eta * tau) this is eq. (10) of the lecture
+    run at temperature tau, i.e. it samples p(x) ~ exp(-E(x) / tau). The "exact" choice is
+    tau = 1 (noise_std = sqrt(2 * step_size)). Image EBMs (Du & Mordatch 2019, Nijkamp et
+    al. 2019) use much less noise than that, i.e. a temperature tau = noise_std^2 /
+    (2 * step_size) far below 1, and they clip the gradient: the chain is then a learned,
+    slightly noisy optimiser rather than an exact sampler.
+
+    Only x receives gradients; the parameters of the energy are untouched (gradients are
+    taken with torch.autograd.grad w.r.t. x only), and x is returned detached.
     """
-    x = x_init.clone().detach()
-    was_training = model.training
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad_(False)
-    x.requires_grad_(True)
-
+    x = x_init.detach().clone()
     for _ in range(steps):
-        energy = -model(x)
-        grad, = torch.autograd.grad(energy.sum(), x)
-        if grad_clamp is not None:
-            grad = grad.clamp(*grad_clamp)
+        x.requires_grad_(True)
+        grad, = torch.autograd.grad(energy_fn(x).sum(), x)
+        if grad_clip is not None:
+            grad = grad.clamp(-grad_clip, grad_clip)
         with torch.no_grad():
-            x -= grad * step_size + torch.randn_like(grad) * noise_std
-            if x_clamp is not None:
-                x.clamp_(*x_clamp)
-
-    for p in model.parameters():
-        p.requires_grad_(True)
-    model.train(was_training)
+            x = x - step_size * grad + noise_std * torch.randn_like(x)
+            if x_range is not None:
+                x = x.clamp(*x_range)
     return x.detach()
 
 
-def ebm_loss(real_scores, fake_scores, alpha):
-    """Contrastive-divergence-style loss. The network outputs a score f(x) = -E(x).
+def ebm_loss(e_real, e_fake, alpha):
+    """Monte-Carlo estimate of the negative log-likelihood gradient, eq. (9):
 
-    Minimising  f(fake).mean() - f(real).mean()  lowers the energy of real data and raises
-    the energy of the model's own samples; this is a Monte-Carlo estimate of the gradient
-    of the negative log-likelihood. The term alpha * (f^2) keeps the scores near zero, so
-    the two energies cannot drift off to +/- infinity.
+        L = E_data[E(x)] - E_model[E(x')] + alpha * E[E(x)^2 + E(x')^2].
+
+    Its theta-gradient is E_data[grad E] - E_model[grad E] (+ the regulariser): energy down on
+    the data, up on the samples. The fake samples are treated as constants (they are
+    detached), which is the contrastive-divergence approximation. The alpha term keeps the
+    energies near zero so that the two terms cannot drift off together to +/- infinity.
+    Returns (loss, contrastive part) so the contrastive gap can be logged.
     """
-    reg_loss = alpha * (real_scores ** 2 + fake_scores ** 2).mean()
-    return fake_scores.mean() - real_scores.mean() + reg_loss
+    cd = e_real.mean() - e_fake.mean()
+    reg = alpha * (e_real ** 2 + e_fake ** 2).mean()
+    return cd + reg, cd
+
+
+class ReplayBuffer:
+    """Persistent Langevin chains (PCD-style), as in Du & Mordatch (2019).
+
+    The buffer stores the end points of earlier chains. Each training step starts most new
+    chains where old ones stopped, so the chains effectively run for many more steps than
+    the K steps per iteration; a fraction `restart` of chains is restarted from fresh noise so
+    that new modes can still be discovered.
+    """
+
+    def __init__(self, init_fn, size, restart=0.05):
+        self.init_fn = init_fn          # init_fn(n) -> n fresh noise samples
+        self.buffer = init_fn(size)
+        self.restart = restart
+
+    def sample(self, n):
+        idx = torch.randint(len(self.buffer), (n,))
+        x = self.buffer[idx].clone()
+        fresh = torch.rand(n) < self.restart
+        if fresh.any():
+            x[fresh] = self.init_fn(int(fresh.sum())).to(x.device)
+        return x, idx
+
+    def update(self, x, idx):
+        self.buffer[idx] = x.detach().to(self.buffer.device)
 
 
 # ---------------------------------------------------------------------------
-# Bitmoji super-resolution data
+# Toy data: 8 Gaussians on a ring
 # ---------------------------------------------------------------------------
-# Grayscale mean and std of the Bitmoji images (pixels in [0, 1]); compute them for
-# your copy of the data with:  python utils.py --stats ./data/bitmoji
-MEAN, STD = 0.8095, 0.3260
+def sample_ring(n, num_modes=8, radius=2.0, std=0.15):
+    """n points from an equal-weight mixture of num_modes Gaussians on a circle."""
+    k = torch.randint(num_modes, (n,))
+    angle = 2 * math.pi * k / num_modes
+    centers = radius * torch.stack([angle.cos(), angle.sin()], dim=1)
+    return centers + std * torch.randn(n, 2)
 
 
-def denormalize(x):
-    return (x * STD + MEAN).clamp(0, 1)
+def ring_log_density(x, num_modes=8, radius=2.0, std=0.15):
+    """Exact log-density of the ring mixture (used only for plotting the ground truth)."""
+    angle = 2 * math.pi * torch.arange(num_modes) / num_modes
+    centers = radius * torch.stack([angle.cos(), angle.sin()], dim=1)
+    d2 = ((x[:, None, :] - centers[None]) ** 2).sum(-1)
+    return torch.logsumexp(-d2 / (2 * std ** 2), dim=1) - math.log(num_modes * 2 * math.pi * std ** 2)
 
 
-class SuperResolutionPairs(Dataset):
-    """Returns (high_res, low_res) pairs built from one ImageFolder.
+# ---------------------------------------------------------------------------
+# Bitmoji images
+# ---------------------------------------------------------------------------
+def _load_one(args):
+    from PIL import Image
+    path, size = args
+    im = Image.open(path).convert('RGB')
+    if im.size != (size, size):
+        im = im.resize((size, size), Image.BICUBIC, reducing_gap=None)
+    return np.asarray(im, dtype=np.uint8)
 
-    high_res: the image resized to hr_size x hr_size.
-    low_res : the same image downsampled to lr_size and upsampled back to hr_size,
-              i.e. a blurry version at the same resolution as the target.
+
+def load_bitmojis(root, size, cache_dir='./data', workers=16, max_images=None):
+    """All images of a flat folder of PNGs as a uint8 tensor (N, 3, size, size).
+
+    The folder is read once (in parallel) and cached as data/bitmojis_<size>.npy, so later
+    runs start instantly. Files are sorted by name, so the split below is deterministic.
     """
-
-    def __init__(self, root, hr_size=128, lr_size=32):
-        self.images = datasets.ImageFolder(root=root, transform=transforms.Compose([
-            transforms.Resize(hr_size),
-            transforms.CenterCrop(hr_size),
-            transforms.ToTensor(),
-        ]))
-        self.blur = transforms.Compose([
-            transforms.Resize(lr_size, antialias=True),
-            transforms.Resize(hr_size, antialias=True),
-        ])
-        self.normalize = transforms.Normalize((MEAN,), (STD,))
-
-    def __len__(self):
-        return len(self.images)
-
-    def __getitem__(self, idx):
-        hr, _ = self.images[idx]
-        lr = self.blur(hr)
-        return self.normalize(hr), self.normalize(lr)
+    os.makedirs(cache_dir, exist_ok=True)
+    cache = os.path.join(cache_dir, f'bitmojis_{size}.npy')
+    if os.path.exists(cache):
+        arr = np.load(cache)
+    else:
+        files = sorted(f for f in os.listdir(root) if f.lower().endswith(('.png', '.jpg', '.jpeg')))
+        with Pool(workers) as pool:
+            arr = np.stack(pool.map(_load_one, [(os.path.join(root, f), size) for f in files],
+                                    chunksize=256))
+        np.save(cache, arr)
+    if max_images is not None:
+        arr = arr[:max_images]
+    return torch.from_numpy(arr).permute(0, 3, 1, 2).contiguous()
 
 
-def compute_stats(path, max_images=50_000):
-    """Grayscale mean / std of the pixels over (up to) max_images images."""
-    dataset = datasets.ImageFolder(root=path, transform=transforms.ToTensor())
-    n = min(len(dataset), max_images)
-    mean, std = 0.0, 0.0
-    for i in range(n):
-        im = dataset[i][0]
-        mean += (im.mean().item() - mean) / (i + 1)
-        std += (im.std().item() - std) / (i + 1)
-    return mean, std
+def train_test_split(images, n_test=2000):
+    """The last n_test images (by file name) are held out for evaluation."""
+    return images[:-n_test], images[-n_test:]
+
+
+def to_model(x_uint8):
+    """uint8 [0, 255] -> float [-1, 1]."""
+    return x_uint8.float() / 127.5 - 1.0
+
+
+def to_image(x):
+    """float [-1, 1] -> float [0, 1] for plotting / saving."""
+    return ((x + 1) / 2).clamp(0, 1)
+
+
+def downsample(x, size):
+    """The degradation operator D of the super-resolution problem: antialiased bicubic."""
+    return F.interpolate(x, size=(size, size), mode='bicubic', antialias=True, align_corners=False)
+
+
+def upsample(x, size):
+    """Bicubic upsampling U (the baseline super-resolver)."""
+    return F.interpolate(x, size=(size, size), mode='bicubic', align_corners=False).clamp(-1, 1)
+
+
+def psnr(x, y):
+    """PSNR in dB per image, for images in [-1, 1] (peak-to-peak 2)."""
+    mse = ((x - y) ** 2).flatten(1).mean(1)
+    return 10 * torch.log10(4.0 / mse)
+
+
+def save_grid(x, path, nrow=8, padding=2):
+    """Save a batch of [-1, 1] images as one PNG grid."""
+    from torchvision.utils import save_image
+    save_image(to_image(x), path, nrow=nrow, padding=padding, pad_value=1.0)
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--stats', type=str, required=True, help='ImageFolder root')
+    parser = argparse.ArgumentParser(description='Pre-cache the Bitmoji folder at a resolution')
+    parser.add_argument('--data-dir', type=str, required=True)
+    parser.add_argument('--size', type=int, default=32)
     args = parser.parse_args()
-    print('mean = %.4f, std = %.4f' % compute_stats(args.stats))
+    imgs = load_bitmojis(args.data_dir, args.size)
+    print(imgs.shape, imgs.dtype, 'mean pixel %.3f' % (imgs.float().mean() / 255))

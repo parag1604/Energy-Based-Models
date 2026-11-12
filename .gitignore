@@ -176,3 +176,10 @@ logs/
 .idea/
 .vscode/
 results/
+
+# EBM tutorial outputs
+*.pt
+*.npy
+.DS_Store
+smoke/
+*.log
