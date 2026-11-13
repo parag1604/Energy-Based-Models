@@ -179,6 +179,32 @@ def psnr(x, y):
     return 10 * torch.log10(4.0 / mse)
 
 
+def roughness(x):
+    """Mean absolute difference between neighbouring pixels: low = blurry, high = noisy."""
+    return (((x[..., 1:, :] - x[..., :-1, :]).abs().mean()
+             + (x[..., :, 1:] - x[..., :, :-1]).abs().mean()) / 2).item()
+
+
+def pca_frechet(x, y, ref, k=64):
+    """A crude sample-quality score: the Frechet distance between Gaussians fitted to x and y
+    after projecting the pixels onto the top-k principal components of `ref` (real images).
+
+    Like FID, but in pixel-PCA space instead of Inception features (no pretrained network
+    needed). It measures whether the samples have the right average face and the right
+    large-scale variations (pose, hair, colours); it is blind to fine detail. Lower is better.
+    """
+    # in float64 on the CPU (float64 linear algebra is very slow on most GPUs)
+    x, y, ref = x.cpu(), y.cpu(), ref.flatten(1).double().cpu()
+    mu = ref.mean(0)
+    _, _, v = torch.linalg.svd(ref[:5000] - mu, full_matrices=False)
+    proj = lambda a: (a.flatten(1).double() - mu) @ v[:k].T
+    a, b = proj(x), proj(y)
+    m1, m2 = a.mean(0), b.mean(0)
+    c1, c2 = torch.cov(a.T), torch.cov(b.T)
+    e = torch.linalg.eigvals(c1 @ c2).real.clamp(min=0).sqrt().sum()   # trace of (C1 C2)^(1/2)
+    return ((m1 - m2) ** 2).sum().item() + (c1.trace() + c2.trace() - 2 * e).item()
+
+
 def save_grid(x, path, nrow=8, padding=2):
     """Save a batch of [-1, 1] images as one PNG grid."""
     from torchvision.utils import save_image
