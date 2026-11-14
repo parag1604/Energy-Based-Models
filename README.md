@@ -25,7 +25,7 @@ pip install -r requirements.txt
 
 `version0.py` and `version1.py --data toy` sample a mixture of 8 Gaussians on a circle on the fly.
 
-The image versions use **Bitmoji faces**: 130,227 cartoon avatar heads, 128x128 RGB PNGs on a white background (about 1.4 GB). The copy used here was downloaded from the internet; we could not pin down the exact original page, so get it from a public Bitmoji dataset (e.g. Kaggle). The scripts expect a **flat folder of image files**:
+The image versions use **Bitmoji faces**: 130,227 cartoon avatar heads, 128x128 RGB PNGs on a white background (about 1.4 GB). The scripts expect a **flat folder of image files**:
 
 ```
 data/bitmojis/
